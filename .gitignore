@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# Experiment outputs
+wandb/
+outputs/
+checkpoints/
+
+# Data (usually large)
+data/
+
+# Environment / secrets
+.env
