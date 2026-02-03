@@ -8,9 +8,9 @@ class DiffLucasKanade(nn.Module):
     """
     Differentiable optical flow via exhaustive search (template matching).
     Works correctly for Moving MNIST with large motions (v_range 1-3).
-    Returns PER-SAMPLE velocities (B, 2) - NOT averaged over batch!
+    Returns PER-SAMPLE velocities (B, num_v) - NOT averaged over batch!
     """
-    def __init__(self, v_range=3, smooth=10.0):
+    def __init__(self, v_range=3, smooth=0.1):
         super().__init__()
         self.v_range = v_range
         self.smooth = smooth  # Temperature for soft-argmax
@@ -31,7 +31,7 @@ class DiffLucasKanade(nn.Module):
             f_t_prev: (B, C, H, W) - previous frame
             
         Returns:
-            u_t: (B, 2) - velocity per sample [vx, vy] ✓ DIFFERENT per sample!
+            probs: (B, num_v) - velocity probabilities per sample
         """
         B, C, H, W = f_t.shape
         
@@ -47,13 +47,244 @@ class DiffLucasKanade(nn.Module):
         
         # Convert errors to weights via softmax (soft-argmin)
         # -errors / smooth: lower error → higher logit
-        weights = F.softmax(-errors / self.smooth, dim=1)  # (B, num_v)
+        probs = F.softmax(-errors / self.smooth, dim=1)  # (B, num_v)
         
-        # Weighted average of velocities - DIFFERENT per batch element
-        u_t = torch.matmul(weights, self.vel_tensor)  # (B, 2) ✓
         
-        return u_t # (B, 2) [vx,vy] per sample
+        return probs  # (B, num_v) per sample
     
+
+
+
+
+class FERNN_Cell(nn.Module):
+    """
+    RNN cell with discrete velocity and integer shifts.
+    Implements: h_{t+1}(x) = ψ₁(u_t) · [W ⋆ h_t](x) + E[f_t](x)
+    Uses torch.roll for integer velocity shifts.
+    """
+    def __init__(self, input_channels, hidden_channels, 
+                 h_kernel_size=3, u_kernel_size=3):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        
+        # Convolution W for hidden state: W ⋆ h_t
+        h_pad = h_kernel_size // 2
+        self.conv_h = nn.Conv2d(hidden_channels, hidden_channels, h_kernel_size,
+                                padding=h_pad, padding_mode='circular', bias=False)
+        
+        # Encoder E (convolution U) for input: U ⋆ f_t
+        u_pad = u_kernel_size // 2
+        self.conv_u = nn.Conv2d(input_channels, hidden_channels, u_kernel_size,
+                                padding=u_pad, padding_mode='circular', bias=False)
+        
+        # Activation function
+        self.activation = nn.ReLU()
+
+
+    def apply_flow_soft(self, x, probs, v_list):
+        """
+        Differentiable flow: weighted sum of all discrete shifts.
+        
+        Args:
+            x: (batch, C, H, W) - tensor to warp
+            probs: (batch, num_v) - softmax over velocities
+            v_list: list of (dx, dy) tuples
+        Returns:
+            warped_x: (batch, C, H, W)
+        """
+        batch, C, H, W = x.shape
+        warped = torch.zeros_like(x)
+
+        for idx, (dx, dy) in enumerate(v_list):
+            shifted = torch.roll(x, shifts=(dy, dx), dims=(2, 3))
+            w = probs[:, idx].view(batch, 1, 1, 1)
+            warped = warped + w * shifted
+
+        return warped
+    
+    def forward(self, f_t, h_t,  probs=None, v_list=None, alpha=1.0):
+        """
+        Forward pass of the RNN cell.
+        
+        Args:
+            f_t: (batch, input_channels, H, W) - current input frame
+            h_t: (batch, hidden_channels, H, W) - current hidden state
+            probs: (batch, num_v) - softmax over velocities (optional)
+            v_list: list of (dx, dy) tuples
+            alpha: float - annealing parameter for soft flow (0 to 1)
+        Returns:
+            h_next: (batch, hidden_channels, H, W) - next hidden state
+        """
+        # Step 1: Convolve hidden state: [W ⋆ h_t]
+        conv_h = self.conv_h(h_t)  # (batch, hidden_channels, H, W)
+        
+        # Step 2: Apply flow transformation: ψ₁(u_t) · [W ⋆ h_t]
+
+        # warped_conv_h = self.apply_flow_soft(conv_h, probs, v_list)
+   
+        # we can aneal the alpha from 0 to 1 during training
+        warped_conv_h = (1 - alpha) * conv_h + alpha * self.apply_flow_soft(conv_h, probs, v_list)
+
+        # Step 3: Encode input: E[f_t] = [U ⋆ f_t]
+        encoded_f = self.conv_u(f_t)  # (batch, hidden_channels, H, W)
+        
+        # Step 4: Combine and activate: σ(ψ₁(u_t)·[W⋆h_t] + E[f_t])
+        h_next = self.activation(warped_conv_h + encoded_f)
+        
+        return h_next
+
+class Seq2SeqFERNN(nn.Module):
+    """
+    Complete sequence-to-sequence model with discrete velocity prediction.
+    """
+    def __init__(self, input_channels, hidden_channels, height, width,
+                 output_channels=None, h_kernel_size=3, u_kernel_size=3,
+                 v_range=3, decoder_conv_layers=1):
+        """
+        Args:
+            input_channels: Number of channels in input frames
+            hidden_channels: Number of channels in hidden state
+            height, width: Spatial dimensions of input
+            output_channels: Number of output channels (defaults to input_channels)
+            h_kernel_size: Kernel size for hidden state convolution
+            u_kernel_size: Kernel size for input encoding
+            v_range: Range of discrete velocities (creates (2*v_range+1)^2 velocities)
+            decoder_conv_layers: Number of convolutional layers in decoder
+        """
+        super().__init__()
+        
+        self.height = height
+        self.width = width
+        self.output_channels = output_channels or input_channels
+        self.v_range = v_range
+        
+        # Discrete velocity predictor (hard classification)
+        self.velocity_predictor = DiffLucasKanade(v_range=v_range, smooth=0.1)
+        
+        # Main RNN cell (uses integer shifts)
+        self.cell = FERNN_Cell(
+            input_channels, hidden_channels,
+            h_kernel_size, u_kernel_size
+        )
+        
+        # Decoder: converts hidden state to output frame
+        decoder_layers = []
+        for _ in range(decoder_conv_layers):
+            decoder_layers.extend([
+                nn.Conv2d(hidden_channels, hidden_channels, 3,
+                         padding=1, padding_mode='circular', bias=False),
+                nn.ReLU()
+            ])
+        decoder_layers.append(
+            nn.Conv2d(hidden_channels, self.output_channels, 3,
+                     padding=1, padding_mode='circular', bias=False)
+        )
+        self.decoder = nn.Sequential(*decoder_layers)
+        
+    def init_hidden(self, batch_size, device):
+        """Initialize hidden state to zeros."""
+        return torch.zeros(batch_size, self.cell.hidden_channels,
+                          self.height, self.width, device=device)
+    
+    def forward(self, input_seq, pred_len, teacher_forcing_ratio=0.0,
+                target_seq=None, return_vel_probs=False):
+        """
+        Forward pass for sequence prediction.
+        
+        Args:
+            input_seq: (batch, T_in, C, H, W) - input sequence
+            pred_len: int - number of frames to predict
+            teacher_forcing_ratio: float - probability of using ground truth
+            target_seq: (batch, pred_len, C, H, W) - ground truth for teacher forcing
+            return_vel_probs: bool - whether to return velocity probability distributions
+            
+        Returns:
+            predictions: (batch, pred_len, C, H, W) - predicted frames
+            vel_probs: optional (batch, T_in+pred_len-1, num_v) - velocity probability distributions
+        """
+        batch, T_in, C, H, W = input_seq.shape
+        device = input_seq.device
+        
+        # Initialize hidden state
+        h = self.init_hidden(batch, device)
+        
+        # Store velocities if requested
+        vel_probs = []
+        
+        # --- Encoder Phase: Process input sequence ---
+        for t in range(T_in):
+            f_t = input_seq[:, t]  # Current frame
+            
+            # Estimate velocity (need current and previous frame)
+            if t == 0:
+                # First frame: no previous frame, use zero velocity
+                probs = torch.zeros(batch, self.velocity_predictor.num_v, device=device)
+                probs[:, self.velocity_predictor.num_v // 2] = 1.0
+            else:
+                f_t_prev = input_seq[:, t-1]  # Previous frame
+                probs = self.velocity_predictor(f_t, f_t_prev)
+            
+            # Update RNN (soft during training, hard during eval)
+            h = self.cell(
+                f_t,
+                h,
+                probs=probs,
+                v_list=self.velocity_predictor.v_list,
+                alpha=1.0 if not self.training else min(1.0, t / T_in)
+            )
+            
+            # Store velocity
+            if return_vel_probs:
+                vel_probs.append(probs)
+        
+        # --- Decoder Phase: Generate predictions ---
+        prev_frame = input_seq[:, -1]  # Start with last input frame
+        predictions = []
+        
+        for t in range(pred_len):
+            # Determine current frame (teacher forcing or previous prediction)
+            if self.training and target_seq is not None and torch.rand(1) < teacher_forcing_ratio:
+                current_frame = target_seq[:, t]
+            else:
+                current_frame = prev_frame
+            
+            # Estimate velocity for this step
+            if t == 0:
+                # First prediction: use last real frame as previous
+                f_t_prev = input_seq[:, -1]
+            else:
+                # Use previous prediction as previous frame
+                f_t_prev = predictions[-1]
+            
+            probs = self.velocity_predictor(current_frame, f_t_prev)
+            
+            # Update RNN (soft during training, hard during eval)
+            h = self.cell(
+                current_frame,
+                h,
+                probs=probs,
+                v_list=self.velocity_predictor.v_list,
+                alpha=1.0 if not self.training else min(1.0, (T_in + t) / (T_in + pred_len))
+            )
+            
+            # Decode hidden state to frame prediction
+            pred = self.decoder(h)
+            predictions.append(pred)
+            prev_frame = pred  # For next iteration
+            
+            # Store velocity
+            if return_vel_probs:
+                vel_probs.append(probs)
+        
+        # Stack predictions along time dimension
+        predictions = torch.stack(predictions, dim=1)  # (batch, pred_len, C, H, W)
+        
+        if return_vel_probs:
+            vel_probs = torch.stack(vel_probs, dim=1)  # (batch, T_in+pred_len-1, num_v)
+            return predictions, vel_probs
+        else:
+            return predictions
+
 
 
 
@@ -97,118 +328,76 @@ class DiffLucasKanade(nn.Module):
 #         h_next = self.activation(u_conv + h_conv)
 #         return h_next
 
-class FERNN_Cell(nn.Module):
-    def __init__(self, input_channels, hidden_channels,
-                 h_kernel_size=3, u_kernel_size=3, v_range=3):
-        super().__init__()
-        self.hidden_channels = hidden_channels
-        # self.v_list = [(x, y) for x in range(-v_range, v_range + 1) for y in range(-v_range, v_range + 1)]
-        self.num_v = 1
-        
-        # Optical flow estimator
-        self.flow_estimator = DiffLucasKanade(v_range=v_range, smooth=10.0)
+# class Seq2SeqFERNN(nn.Module):
+#     def __init__(self, input_channels, hidden_channels, height, width,
+#                  output_channels=None, h_kernel_size=3, u_kernel_size=3,
+#                  v_range=0, pool_type='max', decoder_conv_layers=1):
+#         super().__init__()
+#         self.height = height
+#         self.width = width
+#         self.pool_type = pool_type
+#         self.output_channels = output_channels or input_channels
 
+#         self.cell = FERNN_Cell(
+#             input_channels, hidden_channels,
+#             h_kernel_size, u_kernel_size, v_range)
+#         self.hidden_channels = hidden_channels
+#         self.num_v = self.cell.num_v
 
-        # circular convs without bias
-        u_pad = u_kernel_size // 2
-        h_pad = h_kernel_size // 2
-        self.conv_u = nn.Conv2d(input_channels, hidden_channels, u_kernel_size,
-                                 padding=u_pad, padding_mode='circular', bias=False)
-        self.conv_h = nn.Conv2d(hidden_channels, hidden_channels, h_kernel_size,
-                                 padding=h_pad, padding_mode='circular', bias=False)
-        self.activation = nn.ReLU()
+#         decoder = []
+#         for _ in range(decoder_conv_layers):
+#             decoder += [nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1, padding_mode='circular', bias=False), nn.ReLU()]
+#         decoder += [nn.Conv2d(hidden_channels, self.output_channels, 3, padding=1, padding_mode='circular', bias=False)]
+#         self.decoder_conv = nn.Sequential(*decoder)
 
-    def forward(self, u_t, h_prev, u_t_prev=None):
-        # u_t: (batch, C, H, W)
-        # h_prev: (batch, num_v, hidden, H, W)
-        batch, C, H, W = u_t.size()
-        # Estimate velocity from consecutive frames
-        if u_t_prev is not None:
-            vel = self.flow_estimator(u_t, u_t_prev)  # (batch, 2) [vx, vy]
-        else:
-            vel = torch.zeros(batch, 2, device=u_t.device)  # Zero velocity if no prev frame
-        
-        # Warp hidden state by predicted velocity
-        # vel[:, 0] = vx (width/x-axis), vel[:, 1] = vy (height/y-axis)
-        vx = vel[:, 0].round().long()  # (batch,)
-        vy = vel[:, 1].round().long()  # (batch,)
-        
-        # Apply per-sample roll (batch-wise warping)
-        h_warp = torch.zeros_like(h_prev)
-        for b in range(batch):
-            h_warp[b] = torch.roll(h_prev[b], shifts=(int(vy[b]), int(vx[b])), dims=(1, 2))
-        
-        # Compute h_next(x) = conv_h(warp(h_t))(x) + conv_u(u_t)(x)
-        u_conv = self.conv_u(u_t)  # (batch, hidden, H, W)
-        h_conv = self.conv_h(h_warp)  # (batch, hidden, H, W)
-        
-        h_next = self.activation(u_conv + h_conv)
-        return h_next
+#     def forward(self, input_seq, pred_len, teacher_forcing_ratio=0.0, target_seq=None, return_hidden=False):
+#         batch, T_in, C, H, W = input_seq.size()
+#         device = input_seq.device
 
-class Seq2SeqFERNN(nn.Module):
-    def __init__(self, input_channels, hidden_channels, height, width,
-                 output_channels=None, h_kernel_size=3, u_kernel_size=3,
-                 v_range=0, pool_type='max', decoder_conv_layers=1):
-        super().__init__()
-        self.height = height
-        self.width = width
-        self.pool_type = pool_type
-        self.output_channels = output_channels or input_channels
+#         if return_hidden:
+#             input_seq_hiddens = torch.zeros(batch, T_in, self.num_v, self.hidden_channels, H, W, device=device)
+#             out_seq_hiddens = torch.zeros(batch, pred_len, self.num_v, self.hidden_channels, H, W, device=device)
 
-        self.cell = FERNN_Cell(
-            input_channels, hidden_channels,
-            h_kernel_size, u_kernel_size, v_range)
-        self.hidden_channels = hidden_channels
-        self.num_v = self.cell.num_v
+#         # Initialize hidden state
+#         h = torch.zeros(batch, self.num_v, self.hidden_channels, H, W, device=device)
 
-        decoder = []
-        for _ in range(decoder_conv_layers):
-            decoder += [nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1, padding_mode='circular', bias=False), nn.ReLU()]
-        decoder += [nn.Conv2d(hidden_channels, self.output_channels, 3, padding=1, padding_mode='circular', bias=False)]
-        self.decoder_conv = nn.Sequential(*decoder)
+#         # Encoder pass through cell
+#         for t in range(T_in): 
+#             u_t = input_seq[:, t]
+#             h = self.cell(u_t, h)
 
-    def forward(self, input_seq, pred_len, teacher_forcing_ratio=0.0, target_seq=None, return_hidden=False):
-        batch, T_in, C, H, W = input_seq.size()
-        device = input_seq.device
+#             if return_hidden:
+#                 input_seq_hiddens[:, t] += h.detach()
 
-        if return_hidden:
-            input_seq_hiddens = torch.zeros(batch, T_in, self.hidden_channels, H, W, device=device)
-            out_seq_hiddens = torch.zeros(batch, pred_len, self.hidden_channels, H, W, device=device)
+#         prev = input_seq[:, -1]
+#         outputs = []
 
-        # Initialize hidden state (NO velocity dimension)
-        h = torch.zeros(batch, self.hidden_channels, H, W, device=device)
-        u_t_prev = input_seq[:, 0]
+#         # Decoder
+#         for t in range(pred_len):
+#             if self.training and target_seq is not None and random.random() < teacher_forcing_ratio:
+#                 frame = target_seq[:, t]
+#             else:
+#                 frame = prev.detach()
+#             h = self.cell(frame, h)
 
-        # Encoder pass
-        for t in range(T_in):
-            u_t = input_seq[:, t]
-            h = self.cell(u_t, h, u_t_prev)
-            u_t_prev = u_t
+#             if return_hidden:
+#                 out_seq_hiddens[:, t] += h.detach()
 
-            if return_hidden:
-                input_seq_hiddens[:, t] += h.detach()
+#             # pool over velocities
+#             if self.pool_type == 'max':
+#                 feat = h.max(1)[0]
+#             elif self.pool_type == 'mean':
+#                 feat = h.mean(1)
+#             elif self.pool_type == 'sum':
+#                 feat = h.sum(1)
+#             else:
+#                 feat = h.max(1)[0]
 
-        prev = input_seq[:, -1]
-        outputs = []
+#             out = self.decoder_conv(feat)
+#             outputs.append(out)
+#             prev = out
 
-        # Decoder
-        for t in range(pred_len):
-            if self.training and target_seq is not None and random.random() < teacher_forcing_ratio:
-                frame = target_seq[:, t]
-            else:
-                frame = prev.detach()
-            
-            h = self.cell(frame, h, prev.detach())
-
-            if return_hidden:
-                out_seq_hiddens[:, t] += h.detach()
-
-            # NO velocity pooling needed - hidden is already (batch, hidden, H, W)
-            out = self.decoder_conv(h)
-            outputs.append(out)
-            prev = out
-
-        if return_hidden:
-            return torch.stack(outputs, dim=1), input_seq_hiddens, out_seq_hiddens
-        else:
-            return torch.stack(outputs, dim=1)
+#         if return_hidden:
+#             return torch.stack(outputs, dim=1), input_seq_hiddens, out_seq_hiddens # _, (B, T_in, num_v, C, H, W), (B, T_out, num_v, C, H, W)
+#         else:
+#             return torch.stack(outputs, dim=1)
