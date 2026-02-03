@@ -53,6 +53,95 @@ class DiffLucasKanade(nn.Module):
         return probs  # (B, num_v) per sample
     
 
+class ParametricVelPrediction(nn.Module):
+    """
+    Pure discrete velocity predictor using hard classification.
+    Outputs integer velocities for use with torch.roll.
+    """
+    def __init__(self, input_channels, v_range=2, hidden_dim=6):
+        """
+        Args:
+            input_channels: Number of input channels in frames
+            v_range: Velocity range (creates grid from -v_range to +v_range)
+            hidden_dim: Hidden dimension in the network
+        """
+        super().__init__()
+
+        # Create discrete velocity grid (same as FERNN)
+        # Generate all integer velocity pairs in the range
+        self.v_range = v_range
+        self.v_list = [(x, y) for x in range(-v_range, v_range + 1)
+                      for y in range(-v_range, v_range + 1)]
+        self.num_v = len(self.v_list)
+
+        # Convert v_list to tensor for easy indexing
+        self.register_buffer('velocity_tensor',
+                           torch.tensor(self.v_list, dtype=torch.long))
+
+        # Feature extractor: takes two frames, outputs features
+        # Uses spatial conv to preserve location information for motion
+        self.feature_extractor = nn.Sequential(
+            # Input: concatenated frames [f_t, f_t_prev]
+            nn.Conv2d(2 * input_channels, hidden_dim, 3, padding=1,padding_mode='circular'),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1,padding_mode='circular'),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1,padding_mode='circular'),
+            nn.ReLU(),
+        )
+
+        # Spatial velocity classifier: outputs per-pixel logits, then pools
+        # This preserves spatial info during feature extraction
+        self.velocity_conv = nn.Conv2d(hidden_dim, self.num_v, 3, padding=1)
+
+    def forward(self, f_t, f_t_prev):
+        """
+        Predicts discrete velocity between two frames using hard classification.
+
+        Args:
+            f_t: (batch, C, H, W) - current frame
+            f_t_prev: (batch, C, H, W) - previous frame
+
+        Returns:
+            u_t: (batch, 2) - integer velocity (dy, dx) as torch.long
+            logits: (batch, num_v) - classification logits
+            probs: (batch, num_v) - softmax probabilities (differentiable)
+        """
+        batch_size = f_t.shape[0]
+
+        # Step 1: Concatenate frames along channel dimension
+        # Shape: (batch, 2*C, H, W)
+        x = torch.cat([f_t, f_t_prev], dim=1)
+
+        # Step 2: Extract spatial features
+        # Shape: (batch, hidden_dim, H, W)
+        features = self.feature_extractor(x)
+
+        # Step 3: Get per-pixel velocity logits, then pool
+        # Shape: (batch, num_v, H, W) -> (batch, num_v)
+        logits = self.velocity_conv(features).mean(dim=(2, 3))
+
+        # Step 4: Softmax probabilities (differentiable)
+        probs = F.softmax(logits, dim=1)
+
+        # Step 5: Hard classification - take argmax
+        # Returns index of highest logit for each batch
+        # Shape: (batch,)
+        indices = torch.argmax(logits, dim=1)
+
+        # Step 6: Convert indices to velocity vectors
+        # Use advanced indexing: velocity_tensor[indices] gives (batch, 2)
+        u_t = self.velocity_tensor[indices]  # Shape: (batch, 2)
+
+        return probs
+
+
+
+
+
+
+
+
 
 
 
@@ -159,7 +248,7 @@ class Seq2SeqFERNN(nn.Module):
         self.v_range = v_range
         
         # Discrete velocity predictor (hard classification)
-        self.velocity_predictor = DiffLucasKanade(v_range=v_range, smooth=0.1)
+        self.velocity_predictor = ParametricVelPrediction( input_channels=1, v_range=2, hidden_dim=6)
         
         # Main RNN cell (uses integer shifts)
         self.cell = FERNN_Cell(
@@ -187,7 +276,7 @@ class Seq2SeqFERNN(nn.Module):
                           self.height, self.width, device=device)
     
     def forward(self, input_seq, pred_len, teacher_forcing_ratio=0.0,
-                target_seq=None, return_vel_probs=False):
+                target_seq=None, return_vel_probs=True):
         """
         Forward pass for sequence prediction.
         
