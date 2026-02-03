@@ -139,7 +139,7 @@ class Seq2SeqFERNN(nn.Module):
     """
     def __init__(self, input_channels, hidden_channels, height, width,
                  output_channels=None, h_kernel_size=3, u_kernel_size=3,
-                 v_range=3, decoder_conv_layers=1):
+                 v_range=3, decoder_conv_layers=1,pool_type='max'):
         """
         Args:
             input_channels: Number of channels in input frames
@@ -152,7 +152,7 @@ class Seq2SeqFERNN(nn.Module):
             decoder_conv_layers: Number of convolutional layers in decoder
         """
         super().__init__()
-        
+        self.pool_type = pool_type
         self.height = height
         self.width = width
         self.output_channels = output_channels or input_channels
