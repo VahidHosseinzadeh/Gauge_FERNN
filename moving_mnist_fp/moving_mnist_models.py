@@ -276,7 +276,7 @@ class Seq2SeqFERNN(nn.Module):
                           self.height, self.width, device=device)
     
     def forward(self, input_seq, pred_len, teacher_forcing_ratio=0.0,
-                target_seq=None, return_vel_probs=True):
+                target_seq=None, return_vel_probs=False):
         """
         Forward pass for sequence prediction.
         
