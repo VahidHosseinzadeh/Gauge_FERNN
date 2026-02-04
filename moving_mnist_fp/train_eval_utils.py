@@ -10,7 +10,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, t
     model.train()
     running_loss = 0.0
     pbar = tqdm(dataloader, desc="Training", leave=False)
-    for i, (seq, _) in enumerate(pbar):
+    for i, batch in enumerate(pbar):
+        # Handle both 2-tuple (seq, labels) and 3-tuple (seq, labels, velocities) returns
+        seq = batch[0] if isinstance(batch, (tuple, list)) else batch
         seq = seq.to(device)  # (B, seq_len, C, H, W)
         input_seq = seq[:, :input_frames]
         target_seq = seq[:, input_frames:]
@@ -77,7 +79,9 @@ def eval_epoch(model, dataloader, criterion, device, input_frames, epoch, split_
     running_loss = 0.0
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Evaluating", leave=False)
-        for i, (seq, _) in enumerate(pbar):
+        for i, batch in enumerate(pbar):
+            # Handle both 2-tuple (seq, labels) and 3-tuple (seq, labels, velocities) returns
+            seq = batch[0] if isinstance(batch, (tuple, list)) else batch
             seq = seq.to(device)
             input_seq = seq[:, :input_frames]
             target_seq = seq[:, input_frames:]
