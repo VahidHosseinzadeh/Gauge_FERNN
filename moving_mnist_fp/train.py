@@ -17,6 +17,7 @@ from train_eval_utils import train_epoch, eval_epoch, eval_len_generalization, e
 def main():
     parser = argparse.ArgumentParser(description="Train & evaluate RNN models on Moving MNIST")
     parser.add_argument('--root', type=str, default='./data')
+    parser.add_argument('--use_differentiable_flow', action='store_true')
     parser.add_argument('--seq_len', type=int, default=20)
     parser.add_argument('--input_frames', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=128)
@@ -166,7 +167,8 @@ def main():
                 u_kernel_size=args.kernel_size,
                 v_range=args.v_range,
                 pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers
+                decoder_conv_layers=args.decoder_conv_layers,
+                use_differentiable_flow=args.use_differentiable_flow
             ).to(device)
     elif args.model == "grnn":
         assert args.v_range == 0, "v_range must be 0 for grnn"

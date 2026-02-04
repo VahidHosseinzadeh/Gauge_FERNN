@@ -181,16 +181,36 @@ class FERNN_Cell(nn.Module):
         Returns:
             warped_h: (batch, C, H, W)
         """
-        batch, C, H, W = h.shape
+        # batch, C, H, W = h.shape
         
-        warped = torch.zeros_like(h)
+        # warped = torch.zeros_like(h)
 
-        for idx, (dx, dy) in enumerate(v_list):
-            shifted = torch.roll(h, shifts=(dy, dx), dims=(2, 3))
-            w = probs[:, idx].view(batch, 1, 1, 1)
-            warped = warped + w * shifted
+        # for idx, (dx, dy) in enumerate(v_list):
+        #     shifted = torch.roll(h, shifts=(dy, dx), dims=(2, 3))
+        #     w = probs[:, idx].view(batch, 1, 1, 1)
+        #     warped = warped + w * shifted
 
-        return warped
+        
+    
+        B, C, H, W = h.shape
+        V = len(v_list)
+
+        # stack all shifted versions: (V, B, C, H, W)
+        shifted = torch.stack(
+            [
+                torch.roll(h, shifts=(dy, dx), dims=(2, 3))
+                for (dx, dy) in v_list
+            ],
+            dim=0
+        )
+
+        # reshape probs for broadcasting: (V, B, 1, 1, 1)
+        probs = probs.transpose(0, 1).view(V, B, 1, 1, 1)
+
+        # weighted sum over velocities
+        warped_h = (probs * shifted).sum(dim=0)
+
+        return warped_h
     
     # this might be better as the gradient is not just 1 I think compared to roll function 
     def apply_flow_differentiable(self, x, probs, v_list):
@@ -264,7 +284,7 @@ class Seq2SeqFERNN(nn.Module):
     """
     def __init__(self, input_channels, hidden_channels, height, width,
                  output_channels=None, h_kernel_size=3, u_kernel_size=3,
-                 v_range=3, decoder_conv_layers=1,pool_type='max', use_differentiable_flow=False):
+                 v_range=3, decoder_conv_layers=1,pool_type='max', use_differentiable_flow=True):
         """
         Args:
             input_channels: Number of channels in input frames
