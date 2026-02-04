@@ -97,6 +97,12 @@ class MovingMNISTDataset(Dataset):
                 y0 = self.rng.randint(0, self.image_size)
             positions_x.append(x0)
             positions_y.append(y0)
+        
+        # Convert velocities to tensor: (num_digits, 2) with [vx, vy]
+        velocities_tensor = torch.tensor(
+            list(zip(velocities_x, velocities_y)),
+            dtype=torch.float32
+        )
 
         # Generate each frame by rolling each digit and summing
         for t in range(self.seq_len):
@@ -133,11 +139,11 @@ class MovingMNISTDataset(Dataset):
         if self.transform:
             seq = self.transform(seq)
 
-        # Return sequence and labels (list or int)
+        # Return sequence, labels, and ground truth velocities
         if self.num_digits == 1:
-            return seq, labels[0]
+            return seq, labels[0], velocities_tensor
         else:
-            return seq, torch.tensor(labels, dtype=torch.long)
+            return seq, torch.tensor(labels, dtype=torch.long), velocities_tensor
 
 
 class FixedVelocityMovingMNIST(MovingMNISTDataset):

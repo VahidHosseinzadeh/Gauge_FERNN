@@ -82,11 +82,13 @@ class ParametricVelPrediction(nn.Module):
         # Uses spatial conv to preserve location information for motion
         self.feature_extractor = nn.Sequential(
             # Input: concatenated frames [f_t, f_t_prev]
-            nn.Conv2d(2 * input_channels, hidden_dim, 3, padding=1,padding_mode='circular'),
+            nn.Conv2d(2 * input_channels, hidden_dim, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1,padding_mode='circular'),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1,padding_mode='circular'),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
             nn.ReLU(),
         )
 
@@ -170,26 +172,28 @@ class FERNN_Cell(nn.Module):
         self.activation = nn.ReLU()
 
 
-    def apply_flow_soft(self, x, probs, v_list):
+    def apply_flow_soft(self, h, probs, v_list):
         """
         Differentiable flow: weighted sum of all discrete shifts.
         
         Args:
-            x: (batch, C, H, W) - tensor to warp
+            h: (batch, C, H, W) - tensor to warp
             probs: (batch, num_v) - softmax over velocities
             v_list: list of (dx, dy) tuples
         Returns:
-            warped_x: (batch, C, H, W)
+            warped_h: (batch, C, H, W)
         """
-        batch, C, H, W = x.shape
-        warped = torch.zeros_like(x)
+        batch, C, H, W = h.shape
+        
+        warped = torch.zeros_like(h)
 
         for idx, (dx, dy) in enumerate(v_list):
-            shifted = torch.roll(x, shifts=(dy, dx), dims=(2, 3))
+            shifted = torch.roll(h, shifts=(dy, dx), dims=(2, 3))
             w = probs[:, idx].view(batch, 1, 1, 1)
             warped = warped + w * shifted
 
         return warped
+
     
     def forward(self, f_t, h_t,  probs=None, v_list=None, alpha=1.0):
         """
@@ -200,24 +204,17 @@ class FERNN_Cell(nn.Module):
             h_t: (batch, hidden_channels, H, W) - current hidden state
             probs: (batch, num_v) - softmax over velocities (optional)
             v_list: list of (dx, dy) tuples
-            alpha: float - annealing parameter for soft flow (0 to 1)
+            alpha: float - annealing parameter for soft flow (0 to 1) how much I want to warp h
         Returns:
             h_next: (batch, hidden_channels, H, W) - next hidden state
         """
         # Step 1: Convolve hidden state: [W ⋆ h_t]
         conv_h = self.conv_h(h_t)  # (batch, hidden_channels, H, W)
         
-        # Step 2: Apply flow transformation: ψ₁(u_t) · [W ⋆ h_t]
-
-        # warped_conv_h = self.apply_flow_soft(conv_h, probs, v_list)
-   
+        # Step 2: Apply flow transformation: ψ₁(u_t) · [W ⋆ h_t]   
         # we can aneal the alpha from 0 to 1 during training
         warped_conv_h = (1 - alpha) * conv_h + alpha * self.apply_flow_soft(conv_h, probs, v_list)
-
-        # Step 3: Encode input: E[f_t] = [U ⋆ f_t]
         encoded_f = self.conv_u(f_t)  # (batch, hidden_channels, H, W)
-        
-        # Step 4: Combine and activate: σ(ψ₁(u_t)·[W⋆h_t] + E[f_t])
         h_next = self.activation(warped_conv_h + encoded_f)
         
         return h_next
