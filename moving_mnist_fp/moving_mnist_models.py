@@ -105,9 +105,7 @@ class ParametricVelPrediction(nn.Module):
             f_t_prev: (batch, C, H, W) - previous frame
 
         Returns:
-            u_t: (batch, 2) - integer velocity (dy, dx) as torch.long
-            logits: (batch, num_v) - classification logits
-            probs: (batch, num_v) - softmax probabilities (differentiable)
+           probs: (batch, num_v) - softmax probabilities (differentiable) over velocities
         """
         batch_size = f_t.shape[0]
 
@@ -193,9 +191,47 @@ class FERNN_Cell(nn.Module):
             warped = warped + w * shifted
 
         return warped
+    
+    # this might be better as the gradient is not just 1 I think compared to roll function 
+    def apply_flow_differentiable(self, x, probs, v_list):
+        """
+        Differentiable warping using grid_sample.
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        
+        # Create base grid
+        base_grid = torch.stack(torch.meshgrid(
+            torch.linspace(-1, 1, W, device=device),
+            torch.linspace(-1, 1, H, device=device),
+            indexing='ij'
+        ), dim=-1).unsqueeze(0).repeat(B, 1, 1, 1)
+        
+        warped = torch.zeros_like(x)
+        
+        for idx, (dx, dy) in enumerate(v_list):
+            # Create flow field for this velocity
+            flow_x = (2 * dx / W) * torch.ones_like(base_grid[..., 0:1])
+            flow_y = (2 * dy / H) * torch.ones_like(base_grid[..., 1:2])
+            flow = torch.cat([flow_x, flow_y], dim=-1)
+            
+            # Warp using grid_sample
+            grid = base_grid + flow
+            shifted = F.grid_sample(
+                x, grid,
+                mode='bilinear', padding_mode='border',
+                align_corners=True
+            )
+            
+            # Weighted sum
+            w = probs[:, idx].view(B, 1, 1, 1)
+            warped = warped + w * shifted
+    
+        return warped
+    
 
     
-    def forward(self, f_t, h_t,  probs=None, v_list=None, alpha=1.0):
+    def forward(self, f_t, h_t,  probs=None, v_list=None, alpha=1.0, use_differentiable_flow=False):
         """
         Forward pass of the RNN cell.
         
@@ -213,7 +249,10 @@ class FERNN_Cell(nn.Module):
         
         # Step 2: Apply flow transformation: ψ₁(u_t) · [W ⋆ h_t]   
         # we can aneal the alpha from 0 to 1 during training
-        warped_conv_h = (1 - alpha) * conv_h + alpha * self.apply_flow_soft(conv_h, probs, v_list)
+        if use_differentiable_flow:
+            warped_conv_h = (1 - alpha) * conv_h + alpha * self.apply_flow_differentiable(conv_h, probs, v_list)
+        else:
+            warped_conv_h = (1 - alpha) * conv_h + alpha * self.apply_flow_soft(conv_h, probs, v_list)
         encoded_f = self.conv_u(f_t)  # (batch, hidden_channels, H, W)
         h_next = self.activation(warped_conv_h + encoded_f)
         
@@ -225,7 +264,7 @@ class Seq2SeqFERNN(nn.Module):
     """
     def __init__(self, input_channels, hidden_channels, height, width,
                  output_channels=None, h_kernel_size=3, u_kernel_size=3,
-                 v_range=3, decoder_conv_layers=1,pool_type='max'):
+                 v_range=3, decoder_conv_layers=1,pool_type='max', use_differentiable_flow=False):
         """
         Args:
             input_channels: Number of channels in input frames
@@ -243,6 +282,7 @@ class Seq2SeqFERNN(nn.Module):
         self.width = width
         self.output_channels = output_channels or input_channels
         self.v_range = v_range
+        self.use_differentiable_flow = use_differentiable_flow
         
         # Discrete velocity predictor (hard classification)
         self.velocity_predictor = ParametricVelPrediction( input_channels=1, v_range=2, hidden_dim=6)
@@ -251,6 +291,7 @@ class Seq2SeqFERNN(nn.Module):
         self.cell = FERNN_Cell(
             input_channels, hidden_channels,
             h_kernel_size, u_kernel_size
+
         )
         
         # Decoder: converts hidden state to output frame
@@ -316,7 +357,8 @@ class Seq2SeqFERNN(nn.Module):
                 h,
                 probs=probs,
                 v_list=self.velocity_predictor.v_list,
-                alpha=1.0 if not self.training else min(1.0, t / T_in)
+                alpha=1.0 if not self.training else min(1.0, t / T_in),
+                use_differentiable_flow = self.use_differentiable_flow
             )
             
             # Store velocity

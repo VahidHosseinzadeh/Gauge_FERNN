@@ -17,14 +17,43 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, t
         pred_len = target_seq.size(1)
 
         optimizer.zero_grad() 
-        output_seq = model(
+        result = model(
             input_seq,
             pred_len=pred_len,
             teacher_forcing_ratio=teacher_forcing_ratio,
             target_seq=target_seq
         )  # (B, pred_len, C, H, W)
-        loss = criterion(output_seq, target_seq)
-        loss.backward()
+        
+        # Unpack output and velocity probabilities
+        if isinstance(result, tuple):
+            output_seq, vel_probs = result
+        else:
+            output_seq = result
+            vel_probs = None
+        
+        # MSE loss on predictions
+        mse_loss = criterion(output_seq, target_seq)
+        total_loss = mse_loss
+        
+        # Add velocity regularization losses if available
+        if vel_probs is not None:
+            import torch.nn.functional as F
+            
+            # Velocity entropy regularization (encourage confident predictions)
+            vel_entropy = -torch.sum(vel_probs * torch.log(vel_probs + 1e-8), dim=-1).mean()
+            
+            # Temporal consistency loss (velocity should be smooth across time)
+            temp_consistency_loss = 0
+            if vel_probs.size(1) > 1:  # Only if T > 1
+                for t in range(1, vel_probs.size(1)):
+                    temp_consistency_loss += F.mse_loss(vel_probs[:, t], vel_probs[:, t-1])
+                temp_consistency_loss /= (vel_probs.size(1) - 1)
+            
+            # Combine losses
+            total_loss = mse_loss + 0.01 * vel_entropy + 0.05 * temp_consistency_loss
+        
+        total_loss.backward()
+
         
         # Apply gradient clipping if specified
         if grad_clip is not None:
@@ -32,7 +61,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, input_frames, t
             
         optimizer.step()
 
-        batch_loss = loss.item()
+        batch_loss = total_loss.item()
         running_loss += batch_loss * seq.size(0)
         pbar.set_postfix({"loss": f"{batch_loss:.4f}"})
 
