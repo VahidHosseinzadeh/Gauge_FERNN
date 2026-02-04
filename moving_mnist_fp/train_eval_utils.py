@@ -115,29 +115,33 @@ def eval_len_generalization(model, dataloader, device, input_frames, subsample_t
     with torch.no_grad():
         n_sequences = 0
         pbar = tqdm(dataloader, desc="Evaluating Length Generalization", leave=False)
-        for seq, _ in pbar:
+        for batch in pbar:
+            # support datasets that return (seq, label) or (seq, label, velocities)
+            seq = batch[0] if isinstance(batch, (tuple, list)) else batch
             seq = seq.to(device)
             inp, tgt = seq[:, :input_frames], seq[:, input_frames:]
             T = tgt.size(1)
             pred = model(inp, pred_len=T, teacher_forcing_ratio=0.0)
 
             # MSE per example per timestep  →  [B, T]
-            per_ex_t = ((pred - tgt)**2).mean(dim=(2, 3, 4))  # assume (B,T,C,H,W)
+            per_ex_t = ((pred - tgt) ** 2).mean(dim=(2, 3, 4))  # assume (B,T,C,H,W)
+            # move per-example errors to CPU immediately to avoid accumulating GPU memory
+            per_ex_t_cpu = per_ex_t.cpu()
+
             if first_pass:
-                sum_err  = per_ex_t.sum(dim=0)          # [T]
-                sum_err2 = (per_ex_t**2).sum(dim=0)     # [T]
+                sum_err = per_ex_t_cpu.sum(dim=0)       # [T]
+                sum_err2 = (per_ex_t_cpu ** 2).sum(dim=0)
                 first_pass, T_global = False, T
 
                 log_sequence_predictions_new(inp, tgt, pred, split_name="len_gen", num_samples=10, device=device, subsample_t=subsample_t)
-
             else:
-                sum_err  += per_ex_t.sum(dim=0)
-                sum_err2 += (per_ex_t**2).sum(dim=0)
+                sum_err += per_ex_t_cpu.sum(dim=0)
+                sum_err2 += (per_ex_t_cpu ** 2).sum(dim=0)
 
-            n_sequences += per_ex_t.size(0)
-            
-            # Update progress bar with current batch size
-            pbar.set_postfix({"loss": per_ex_t.mean()})
+            n_sequences += per_ex_t_cpu.size(0)
+
+            # Update progress bar with current batch MSE (scalar)
+            pbar.set_postfix({"loss": float(per_ex_t_cpu.mean().item())})
 
     mean = sum_err / n_sequences
     var  = sum_err2 / n_sequences - mean**2
