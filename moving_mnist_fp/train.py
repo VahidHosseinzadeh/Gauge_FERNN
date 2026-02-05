@@ -166,7 +166,6 @@ def main():
                 h_kernel_size=args.kernel_size,
                 u_kernel_size=args.kernel_size,
                 v_range=args.v_range,
-                pool_type='max',
                 decoder_conv_layers=args.decoder_conv_layers,
                 use_differentiable_flow=args.use_differentiable_flow
             ).to(device)
@@ -180,8 +179,8 @@ def main():
                 h_kernel_size=args.kernel_size,
                 u_kernel_size=args.kernel_size,
                 v_range=0,
-                pool_type='max',
-                decoder_conv_layers=args.decoder_conv_layers
+                decoder_conv_layers=args.decoder_conv_layers,
+                use_differentiable_flow=args.use_differentiable_flow
             ).to(device)
 
     # Load model if specified
