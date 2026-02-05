@@ -4,7 +4,28 @@ from torchvision.utils import make_grid
 import matplotlib.pyplot as plt
 import numpy as np
 import math
+import os
 import wandb
+
+# Global switch to enable/disable wandb logging. Set env var WANDB_ENABLED=0 to disable.
+WANDB_ENABLED = os.environ.get("WANDB_ENABLED", "1") not in ("0", "False", "false")
+
+
+def safe_wandb_log(payload: dict):
+    """Log to wandb if enabled and initialized; silently no-op otherwise."""
+    if not WANDB_ENABLED:
+        return
+    try:
+        # wandb.run is None when wandb.init() hasn't been called
+        if getattr(wandb, "run", None) is None:
+            return
+    except Exception:
+        return
+    try:
+        wandb.log(payload)
+    except Exception:
+        # Ignore any wandb logging errors in environments where wandb isn't configured
+        return
 
 def log_sequence_predictions(
         input_seq, target_seq, output_seq,
@@ -80,7 +101,7 @@ def log_sequence_predictions(
             axes[row, i].axis('off')
 
     plt.tight_layout()
-    wandb.log({f"{split_name}_sequences": wandb.Image(fig)})
+    safe_wandb_log({f"{split_name}_sequences": wandb.Image(fig)})
     plt.close(fig)
     
 
@@ -145,5 +166,5 @@ def log_sequence_predictions_new(
         fig.suptitle(f"{split_name} sample {idx}", fontsize=12)
 
         # ----------- log to wandb & close -------------------------------------
-        wandb.log({f"{split_name}sequence_{idx}": wandb.Image(fig)})
+        safe_wandb_log({f"{split_name}sequence_{idx}": wandb.Image(fig)})
         plt.close(fig)
