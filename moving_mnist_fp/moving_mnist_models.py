@@ -366,7 +366,7 @@ class FERNN_Cell(nn.Module):
         if probs is not None and v_list is not None:
             assert len(v_list) == probs.shape[1], \
             f"v_list length ({len(v_list)}) doesn't match probs shape ({probs.shape[1]})"
-            
+
             # Step 1: MEASURE VELOCITY CONFIDENCE
         if self.use_velocity_gating and probs is not None:
             entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1, keepdim=True)
@@ -404,7 +404,7 @@ class FERNN_Cell(nn.Module):
 
 
 
-class SeqtoSeqRNN(nn.Module):
+class Seq2SeqFERNN(nn.Module):
     """
     Complete sequence-to-sequence model with discrete velocity prediction.
     """
