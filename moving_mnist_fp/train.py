@@ -166,9 +166,8 @@ def main():
                 h_kernel_size=args.kernel_size,
                 u_kernel_size=args.kernel_size,
                 v_range=args.v_range,
-                decoder_conv_layers=args.decoder_conv_layers,
-                use_differentiable_flow=args.use_differentiable_flow
-            ).to(device)
+                decoder_conv_layers=args.decoder_conv_layers
+                 ).to(device)
     elif args.model == "grnn":
         assert args.v_range == 0, "v_range must be 0 for grnn"
         model = Seq2SeqFERNN(
@@ -180,7 +179,6 @@ def main():
                 u_kernel_size=args.kernel_size,
                 v_range=0,
                 decoder_conv_layers=args.decoder_conv_layers,
-                use_differentiable_flow=args.use_differentiable_flow
             ).to(device)
 
     # Load model if specified
